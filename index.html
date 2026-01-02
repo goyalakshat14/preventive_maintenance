@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Industrial Vibration Monitoring Dashboard</title>
+
+<style>
+body {
+    background: #111;
+    color: #ddd;
+    font-family: "Segoe UI", Arial, sans-serif;
+    margin: 0;
+    overflow-x: hidden;
+}
+
+header {
+    background: #222;
+    padding: 12px 20px;
+    border-bottom: 1px solid #333;
+    color: #f0f0f0;
+    font-size: 24px;
+    font-weight: 600;
+}
+
+#sidebar {
+    width: 280px;
+    background: #1a1a1a;
+    border-right: 1px solid #333;
+    height: 100vh;
+    float: left;
+    padding: 15px;
+}
+
+#content {
+    margin-left: 280px;
+    padding: 20px;
+}
+
+h3 {
+    margin-top: 25px;
+    color: #68a0ff;
+}
+
+label {
+    font-size: 14px;
+    color: #ccc;
+}
+
+input, select {
+    width: 95%;
+    padding: 6px;
+    margin: 5px 0 10px 0;
+    background: #222;
+    border: 1px solid #444;
+    color: #eee;
+}
+
+button {
+    width: 100%;
+    padding: 10px;
+    background: #2e7dff;
+    border: none;
+    color: white;
+    cursor: pointer;
+    margin-top: 15px;
+    font-weight: bold;
+}
+button:hover { background: #4590ff; }
+
+canvas {
+    width: 95%;
+    height: 260px;
+    background: #000;
+    margin: 20px 20px;
+    border: 1px solid #333;
+}
+
+.tab-button {
+    display: inline-block;
+    padding: 10px 20px;
+    background: #222;
+    color: #aaa;
+    margin: 0px 20px;
+    cursor: pointer;
+    border: 1px solid #333;
+}
+.tab-button.active {
+    background: #2e7dff;
+    color: #fff;
+}
+
+.tab-content { display: none; }
+.tab-content.active { display: block; }
+</style>
+</head>
+
+<body>
+
+<header>⚙ Industrial Vibration Monitoring Dashboard</header>
+
+<div id="sidebar">
+    <h3>Signal Controls</h3>
+
+    <label>Filter Type</label>
+    <select id="filterType">
+        <option value="none">None</option>
+        <option value="low">Low-pass</option>
+        <option value="high">High-pass</option>
+        <option value="band">Band-pass</option>
+    </select>
+
+    <label>Low Cut (Hz)</label>
+    <input id="lowCut" type="number" value="5">
+
+    <label>High Cut (Hz)</label>
+    <input id="highCut" type="number" value="50">
+
+    <label>Band Low (Hz)</label>
+    <input id="bandLow" type="number" value="100">
+
+    <label>Band High (Hz)</label>
+    <input id="bandHigh" type="number" value="500">
+
+    <h3>FFT Controls</h3>
+
+    <label>FFT Size</label>
+    <select id="fftSize">
+        <option value="1024">1024</option>
+        <option value="2048" selected>2048</option>
+        <option value="4096">4096</option>
+    </select>
+
+    <label>FFT Update (ms)</label>
+    <input id="fftUpdate" type="number" value="200">
+
+    <h3>Bearing Settings</h3>
+
+    <h2>RPM: <span id="rpmDisplay">--</span></h2>
+
+    <button onclick="applySettings()">Apply Settings</button>
+</div>
+
+<div id="content">
+
+    <!-- Tabs -->
+    <div>
+        <div id="tab_wave" class="tab-button active" onclick="switchTab('wave')">Waveform</div>
+        <div id="tab_fft" class="tab-button" onclick="switchTab('fft')">FFT Spectrum</div>
+        <div id="tab_env" class="tab-button" onclick="switchTab('env')">Envelope</div>
+        <div id="tab_water" class="tab-button" onclick="switchTab('water')">Waterfall</div>
+    </div>
+
+    <!-- Waveform Panel -->
+    <div id="panel_wave" class="tab-content active">
+        <canvas id="cx"></canvas>
+        <canvas id="cy"></canvas>
+        <canvas id="cz"></canvas>
+    </div>
+
+    <!-- FFT Panel -->
+    <div id="panel_fft" class="tab-content">
+        <canvas id="fftCanvas"></canvas>
+    </div>
+
+    <!-- Envelope Panel -->
+    <div id="panel_env" class="tab-content">
+        <canvas id="envCanvas"></canvas>
+    </div>
+
+    <!-- Waterfall Panel -->
+    <div id="panel_water" class="tab-content">
+        <canvas id="waterCanvas"></canvas>
+    </div>
+
+</div>
+
+<script>
+// -----------------------
+// WebSocket
+// -----------------------
+const ws = new WebSocket("ws://" + location.host + "/ws");
+
+// Waveform buffers
+const N = 600;
+let bx = Array(N).fill(0);
+let by = Array(N).fill(0);
+let bz = Array(N).fill(0);
+
+// Canvas contexts
+const cx = document.getElementById("cx").getContext("2d");
+const cy = document.getElementById("cy").getContext("2d");
+const cz = document.getElementById("cz").getContext("2d");
+const fftctx = document.getElementById("fftCanvas").getContext("2d");
+const envctx = document.getElementById("envCanvas").getContext("2d");
+const waterctx = document.getElementById("waterCanvas").getContext("2d");
+
+// Draw waveform lines
+function drawLine(ctx, arr, color) {
+    ctx.fillStyle="#000";
+    ctx.fillRect(0,0,ctx.canvas.width,ctx.canvas.height);
+
+    ctx.strokeStyle=color;
+    ctx.beginPath();
+    for (let i=0;i<arr.length;i++){
+        let x=i/arr.length*ctx.canvas.width;
+        let y=ctx.canvas.height - arr[i]/4096 * ctx.canvas.height;
+        if (i==0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+    }
+    ctx.stroke();
+}
+
+function drawFFT(freqs, data, bearing) {
+    fftctx.fillStyle="#000";
+    fftctx.fillRect(0,0,fftctx.canvas.width,fftctx.canvas.height);
+
+    fftctx.strokeStyle="#0f0";
+    fftctx.beginPath();
+
+    let max = Math.max(...data);
+    
+    for (let i=0;i<data.length;i++){
+        let x = freqs[i]/freqs[freqs.length-1] * fftctx.canvas.width;
+        let y = fftctx.canvas.height - (data[i]/max)*fftctx.canvas.height;
+        if (i==0) fftctx.moveTo(x,y);
+        else fftctx.lineTo(x,y);
+    }
+    fftctx.stroke();
+
+    // Add fault frequency lines
+    fftctx.strokeStyle="#f00";
+    for (let k in bearing){
+        let f = bearing[k];
+        let x = f/(freqs[freqs.length-1]) * fftctx.canvas.width;
+        fftctx.beginPath();
+        fftctx.moveTo(x,0);
+        fftctx.lineTo(x,fftctx.canvas.height);
+        fftctx.stroke();
+    }
+}
+
+function drawEnv(freqs, env) {
+    envctx.fillStyle="#000";
+    envctx.fillRect(0,0,envctx.canvas.width,envctx.canvas.height);
+
+    envctx.strokeStyle="#ffcc00";
+    envctx.beginPath();
+
+    let max = Math.max(...env);
+
+    for (let i=0;i<env.length;i++){
+        let x=i/env.length*envctx.canvas.width;
+        let y=envctx.canvas.height - (env[i]/max)*envctx.canvas.height;
+        if (i==0) envctx.moveTo(x,y); else envctx.lineTo(x,y);
+    }
+    envctx.stroke();
+}
+
+function drawWaterfall(water) {
+    let h = waterctx.canvas.height;
+    let w = waterctx.canvas.width;
+
+    waterctx.fillStyle="#000";
+    waterctx.fillRect(0,0,w,h);
+
+    let rows = water.length;
+
+    for (let r=0;r<rows;r++){
+        let row = water[r];
+        let max = Math.max(...row);
+
+        for (let c=0;c<row.length;c++){
+            let value = row[c]/max;
+            let hue = 240 - value*240;   // blue → red
+            waterctx.fillStyle = `hsl(${hue},100%,50%)`;
+
+            let x = c/row.length * w;
+            let y = h - (r/rows) * h;
+            waterctx.fillRect(x,y, w/row.length, h/rows);
+        }
+    }
+}
+
+function drawFreqMarker(ctx, fs, freq, label) {
+    let w = fftctx.canvas.width;
+    let h = fftctx.canvas.height;
+    const x = (freq / (fs / 2)) * w;
+
+    ctx.strokeStyle = "rgba(255,0,0,0.7)";
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, h);
+    ctx.stroke();
+
+    ctx.fillStyle = "red";
+    ctx.fillText(label, x + 3, 12);
+}
+
+
+// Receive data
+ws.onmessage = evt => {
+    let msg = JSON.parse(evt.data);
+
+    if (msg.type === "raw") {
+        bx.push(msg.x); bx.shift();
+        by.push(msg.y); by.shift();
+        bz.push(msg.z); bz.shift();
+
+        drawLine(cx,bx,"#f33");
+        drawLine(cy,by,"#3f3");
+        drawLine(cz,bz,"#33f");
+    }
+
+    if (msg.type === "fft") {
+        document.getElementById("rpmDisplay").innerText =
+          msg.rpm.toFixed(1) + " RPM";
+
+        drawFFT(msg.freqs, msg.fft, msg.bearing);
+
+        drawFreqMarker(fftctx, msg.fs, msg.rpm / 60, "RPM " );
+        drawFreqMarker(fftctx, msg.fs,  2 * msg.rpm / 60, "2×");
+        drawFreqMarker(fftctx, msg.fs, 3 * msg.rpm / 60, "3×" );
+        drawFreqMarker(fftctx, msg.fs, 4 * msg.rpm / 60, "4× " +  4*Math.floor(msg.rpm));
+
+        drawEnv(msg.freqs, msg.envelope);
+        drawWaterfall(msg.waterfall);
+    }
+};
+
+// Apply settings button
+function applySettings() {
+    let cfg = {
+        sample_rate: 500,
+        fft_size: parseInt(document.getElementById("fftSize").value),
+        fft_update_ms: parseInt(document.getElementById("fftUpdate").value),
+        filter_type: document.getElementById("filterType").value,
+        low_cut: parseInt(document.getElementById("lowCut").value),
+        high_cut: parseInt(document.getElementById("highCut").value),
+        band_low: parseInt(document.getElementById("bandLow").value),
+        band_high: parseInt(document.getElementById("bandHigh").value),
+        rpm: parseInt(document.getElementById("rpm").value),
+    };
+    ws.send(JSON.stringify({cmd:"config", data: cfg}));
+}
+
+// Tab switching
+function switchTab(name){
+    let tabs = ["wave","fft","env","water"];
+    for (let t of tabs){
+        document.getElementById("panel_"+t).classList.remove("active");
+        document.getElementById("tab_"+t).classList.remove("active");
+    }
+    document.getElementById("panel_"+name).classList.add("active");
+    document.getElementById("tab_"+name).classList.add("active");
+}
+</script>
+
+</body>
+</html>
