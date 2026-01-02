@@ -11,6 +11,7 @@ from aiohttp import web
 RAW_X, RAW_Y, RAW_Z, RAW_T = [], [], [], []
 BUFFER_SIZE = 50000
 WS_CLIENTS = set()
+client_nodes = {}
 
 # ============================================================
 # CONFIG (all auto-updated)
@@ -140,25 +141,34 @@ class UDPProtocol(asyncio.DatagramProtocol):
         self.transport = transport
 
     def datagram_received(self, data, addr):
-        if len(data) != 10:
             return
 
-        ts, x, y, z = struct.unpack("<Ihhh", data)
 
         if csv_file:
             csv_file.write(f"{ts},{x},{y},{z}\n")
             check_rollover()
 
-        RAW_T.append(ts)
-        RAW_X.append(x)
-        RAW_Y.append(y)
-        RAW_Z.append(z)
+        c = client_nodes[client_id]
+        c["RAW_T"].append(ts)
+        c["RAW_X"].append(x)
+        c["RAW_Y"].append(y)
+        c["RAW_Z"].append(z)
 
-        if len(RAW_T) > BUFFER_SIZE:
-            RAW_T.pop(0); RAW_X.pop(0); RAW_Y.pop(0); RAW_Z.pop(0)
+        if len(c["RAW_T"]) > BUFFER_SIZE:
+            c["RAW_T"].pop(0)
+            c["RAW_X"].pop(0)
+            c["RAW_Y"].pop(0)
+            c["RAW_Z"].pop(0)
+        # RAW_T.append(ts)
+        # RAW_X.append(x)
+        # RAW_Y.append(y)
+        # RAW_Z.append(z)
+
+        # if len(RAW_T) > BUFFER_SIZE:
+        #     RAW_T.pop(0); RAW_X.pop(0); RAW_Y.pop(0); RAW_Z.pop(0)
 
         # Live waveforms
-        msg = {"type":"raw", "x":x, "y":y, "z":z}
+        msg = {"type":"raw", "client_id":client_id, "x":x, "y":y, "z":z}
         for ws in WS_CLIENTS:
             asyncio.create_task(ws.send_str(json.dumps(msg)))
 
@@ -316,7 +326,8 @@ async def main():
     open_new_csv()
 
     await loop.create_datagram_endpoint(lambda: UDPProtocol(), local_addr=("0.0.0.0", 5006))
-
+    
+    
     asyncio.create_task(fft_task())
 
     app = web.Application()
