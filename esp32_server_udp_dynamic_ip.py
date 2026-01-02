@@ -4,6 +4,11 @@ import struct
 import numpy as np
 from scipy.signal import butter, filtfilt, hilbert
 from aiohttp import web
+from zeroconf.asyncio import AsyncZeroconf
+from zeroconf import ServiceInfo
+import socket
+
+
 
 # ============================================================
 # GLOBAL BUFFERS
@@ -11,6 +16,7 @@ from aiohttp import web
 RAW_X, RAW_Y, RAW_Z, RAW_T = [], [], [], []
 BUFFER_SIZE = 50000
 WS_CLIENTS = set()
+AZEROCONF = None
 client_nodes = {}
 
 # ============================================================
@@ -141,8 +147,10 @@ class UDPProtocol(asyncio.DatagramProtocol):
         self.transport = transport
 
     def datagram_received(self, data, addr):
+        if len(data) != 11:
             return
 
+        client_id, ts, x, y, z = struct.unpack("<BIhhh", data)
 
         if csv_file:
             csv_file.write(f"{ts},{x},{y},{z}\n")
@@ -312,6 +320,23 @@ async def websocket_handler(request):
     WS_CLIENTS.remove(ws)
     return ws
 
+
+async def start_mdns():
+    global AZEROCONF
+    ip = socket.gethostbyname(socket.gethostname())
+    info = ServiceInfo(
+        "_vibration._udp.local.",
+        "VibrationServer._vibration._udp.local.",
+        addresses=[socket.inet_aton(ip)],
+        port=5006,
+        properties={},
+        server="vibration-server.local."
+    )
+    AZEROCONF = AsyncZeroconf()
+    await AZEROCONF.async_register_service(info)
+    print(f"[mDNS] Server advertised as vibration-server.local")
+
+
 # ============================================================
 # HTTP ROUTES
 # ============================================================
@@ -324,6 +349,7 @@ async def index(request):
 async def main():
     loop = asyncio.get_running_loop()
     open_new_csv()
+    await start_mdns()
 
     await loop.create_datagram_endpoint(lambda: UDPProtocol(), local_addr=("0.0.0.0", 5006))
     
