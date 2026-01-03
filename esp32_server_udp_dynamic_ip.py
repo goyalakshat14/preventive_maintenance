@@ -1,6 +1,4 @@
-import asyncio
-import json
-import struct
+import asyncio, struct, json, time, os, socket, datetime
 import numpy as np
 from scipy.signal import butter, filtfilt, hilbert
 from aiohttp import web
@@ -13,11 +11,21 @@ import socket
 # ============================================================
 # GLOBAL BUFFERS
 # ============================================================
+# ================= CONFIG =================
+UDP_PORT = 5006
+HTTP_PORT = 8080
+BUFFER_SIZE = 20000
+FFT_SIZE = 2048
+FFT_PERIOD = 0.25        # seconds
+CLIENT_TIMEOUT = 5.0     # seconds (auto-disconnect)
+
+# ============== CLIENT STORAGE ============
+clients = {}   # client_id -> state
 RAW_X, RAW_Y, RAW_Z, RAW_T = [], [], [], []
 BUFFER_SIZE = 50000
 WS_CLIENTS = set()
 AZEROCONF = None
-client_nodes = {}
+
 
 # ============================================================
 # CONFIG (all auto-updated)
@@ -42,7 +50,6 @@ PITCH_DIAMETER = 25.0
 CONTACT_ANGLE = 0
 BALL_COUNT = 8
 
-some_error = 0
 def bearing_freqs():
     if CONFIG["rpm"] <= 0:
         return {"BPFO":0, "BPFI":0, "BSF":0, "FT":0}
@@ -60,6 +67,21 @@ def bearing_freqs():
     }
 
 
+# ============== CLIENT STATE INIT =========
+def new_client(cid):
+    now = time.time()
+    fname = f"vibration_client{cid}_{datetime.datetime.now():%Y%m%d_%H%M%S}.csv"
+    f = open(fname, "w", buffering=1)
+    f.write("timestamp_us,x,y,z\n")
+    print(f"[NEW CLIENT] id={cid} csv={fname}")
+
+    return {
+        "T": [], "X": [], "Y": [], "Z": [],
+        "last_seen": now,
+        "csv": f,
+        "rpm": 0.0,
+        "waterfall": []
+    }
 
 import datetime
 
@@ -147,53 +169,39 @@ class UDPProtocol(asyncio.DatagramProtocol):
         self.transport = transport
 
     def datagram_received(self, data, addr):
-        if len(data) != 11:
-            return
+        if len(data) != 11: return
+        cid, ts, x, y, z = struct.unpack("<BIhhh", data)
 
-        client_id, ts, x, y, z = struct.unpack("<BIhhh", data)
+        if cid not in clients:
+            clients[cid] = new_client(cid)
 
-        if csv_file:
-            csv_file.write(f"{ts},{x},{y},{z}\n")
-            check_rollover()
+        c = clients[cid]
+        c["last_seen"] = time.time()
 
-        c = client_nodes[client_id]
-        c["RAW_T"].append(ts)
-        c["RAW_X"].append(x)
-        c["RAW_Y"].append(y)
-        c["RAW_Z"].append(z)
+        c["T"].append(ts)
+        c["X"].append(x)
+        c["Y"].append(y)
+        c["Z"].append(z)
 
-        if len(c["RAW_T"]) > BUFFER_SIZE:
-            c["RAW_T"].pop(0)
-            c["RAW_X"].pop(0)
-            c["RAW_Y"].pop(0)
-            c["RAW_Z"].pop(0)
-        # RAW_T.append(ts)
-        # RAW_X.append(x)
-        # RAW_Y.append(y)
-        # RAW_Z.append(z)
+        c["csv"].write(f"{ts},{x},{y},{z}\n")
 
-        # if len(RAW_T) > BUFFER_SIZE:
-        #     RAW_T.pop(0); RAW_X.pop(0); RAW_Y.pop(0); RAW_Z.pop(0)
-
-        # Live waveforms
-        msg = {"type":"raw", "client_id":client_id, "x":x, "y":y, "z":z}
+        if len(c["T"]) > BUFFER_SIZE:
+            for k in ("T","X","Y","Z"): c[k].pop(0)
+        
+        msg = {"type":"raw", "client_id":cid, "x":x, "y":y, "z":z}
         for ws in WS_CLIENTS:
             asyncio.create_task(ws.send_str(json.dumps(msg)))
 
 # ============================================================
 # AUTO SAMPLE RATE
 # ============================================================
-def auto_sample_rate():
-    if len(RAW_T) < 200:
-        return 0
 
-    diffs = np.diff(RAW_T[-200:])
-    diffs = diffs[diffs > 0]   # remove timestamp rollovers
-    if len(diffs) == 0:
-        return 0
+def auto_fs(timestamps):
+    if len(timestamps) < 50: return 0
+    d = np.diff(timestamps[-50:])
+    d = d[d > 0]
+    return 1e6 / np.median(d) if len(d) else 0
 
-    median_us = np.median(diffs)
-    return 1_000_000.0 / median_us
 
 # ============================================================
 # AUTO RPM DETECTION
@@ -231,73 +239,55 @@ def auto_rpm(signal, fs):
 # ============================================================
 # FFT TASK
 # ============================================================
-async def fft_task():
-    waterfall = []
-    global some_error
-    global WS_CLIENTS
-
+# ============== ANALYSIS LOOP ==============
+async def analysis_task():
     while True:
         try:
-            temp_ws_clients = WS_CLIENTS.copy()
-            
-            await asyncio.sleep(CONFIG["fft_update_ms"]/1000)
+            await asyncio.sleep(FFT_PERIOD)
+            now = time.time()
 
-            if len(RAW_X) < CONFIG["fft_size"]:
-                continue
+            dead = [cid for cid,c in clients.items()
+                    if now - c["last_seen"] > CLIENT_TIMEOUT]
 
-            CONFIG["sample_rate"] = auto_sample_rate()
+            for cid in dead:
+                print(f"[DISCONNECT] client {cid}")
+                clients[cid]["csv"].close()
+                del clients[cid]
 
-            fs = CONFIG["sample_rate"]
-            if fs <= 0:
-                continue
-            # print("getting data")
-            sx = np.array(RAW_X[-CONFIG["fft_size"]:], float)
-            sy = np.array(RAW_Y[-CONFIG["fft_size"]:], float)
-            sz = np.array(RAW_Z[-CONFIG["fft_size"]:], float)
+            for cid,c in clients.items():
+                if len(c["X"]) < FFT_SIZE: continue
 
-            sx = sx - np.mean(sx)
-            sy = sy - np.mean(sx)
-            sz = sz - np.mean(sx)
-            # Filtering
-            sx_f = apply_filter(sx)
-            sy_f = apply_filter(sy)
-            sz_f = apply_filter(sz)
+                fs = auto_fs(c["T"])
+                if fs <= 0: continue
 
-            # Envelope FFT (for bearing)
-            env = envelope(sx_f)
+                sx = np.array(c["X"][-FFT_SIZE:], float)
+                sy = np.array(c["Y"][-FFT_SIZE:], float)
+                sz = np.array(c["Z"][-FFT_SIZE:], float)
 
-            # Auto RPM detect
-            CONFIG["rpm"] = auto_rpm(sx_f, fs)
+                sx = sx - np.mean(sx)
+                sy = sy - np.mean(sx)
+                sz = sz - np.mean(sx)
 
-            # FFTs
-            freqs = np.fft.rfftfreq(CONFIG["fft_size"], 1/fs)
-            fft_vals = np.abs(np.fft.rfft(sx_f))
-            fx = np.abs(np.fft.rfft(sx_f))
-            fy = np.abs(np.fft.rfft(sy_f))
-            fz = np.abs(np.fft.rfft(sz_f))
-            fe = np.abs(np.fft.rfft(env))
+                
+                rpm = auto_rpm(sx, fs)
+                c["rpm"] = rpm
 
-            # Waterfall (X only)
-            waterfall.append(fx.tolist())
-            if len(waterfall) > 80:
-                waterfall.pop(0)
+                fftx = np.abs(np.fft.rfft(sx))
+                ffty = np.abs(np.fft.rfft(sy))
+                fftz = np.abs(np.fft.rfft(sz))
+                freqs = np.fft.rfftfreq(len(sx), 1/fs)
 
-            packet = {
-                "type":"fft",
-                "freqs": freqs.tolist(),
-                "fft": fft_vals.tolist(),
-                "envelope": fe.tolist(),
-                "rpm": CONFIG["rpm"],
-                "bearing": {},
-                "waterfall": waterfall,
-                "fs":fs
-            }
+                pkt = {
+                    "type": "fft",
+                    "client": cid,
+                    "rpm": rpm,
+                    "freqs": freqs.tolist(),
+                    "fft": fftx.tolist(),
+                    "alive": True
+                }
 
-            for ws in temp_ws_clients:
-                try:
-                    await ws.send_str(json.dumps(packet))
-                except Exception as inst:
-                    print(inst)
+                for ws in WS_CLIENTS:
+                    await ws.send_str(json.dumps(pkt))
         except Exception as inst:
             print(inst)
 
@@ -322,20 +312,17 @@ async def websocket_handler(request):
 
 
 async def start_mdns():
-    global AZEROCONF
+    az = AsyncZeroconf()
     ip = socket.gethostbyname(socket.gethostname())
     info = ServiceInfo(
         "_vibration._udp.local.",
         "VibrationServer._vibration._udp.local.",
         addresses=[socket.inet_aton(ip)],
-        port=5006,
-        properties={},
+        port=UDP_PORT,
         server="vibration-server.local."
     )
-    AZEROCONF = AsyncZeroconf()
-    await AZEROCONF.async_register_service(info)
-    print(f"[mDNS] Server advertised as vibration-server.local")
-
+    await az.async_register_service(info)
+    print("[mDNS] vibration-server.local")
 
 # ============================================================
 # HTTP ROUTES
@@ -348,23 +335,21 @@ async def index(request):
 # ============================================================
 async def main():
     loop = asyncio.get_running_loop()
-    open_new_csv()
     await start_mdns()
 
-    await loop.create_datagram_endpoint(lambda: UDPProtocol(), local_addr=("0.0.0.0", 5006))
+    await loop.create_datagram_endpoint(lambda: UDPProtocol(), local_addr=("0.0.0.0", UDP_PORT))
     
     
-    asyncio.create_task(fft_task())
+    asyncio.create_task(analysis_task())
 
     app = web.Application()
     app.add_routes([web.get("/", index), web.get("/ws", websocket_handler)])
 
     runner = web.AppRunner(app)
     await runner.setup()
-    await web.TCPSite(runner, "0.0.0.0", 8080).start()
+    await web.TCPSite(runner, "0.0.0.0", HTTP_PORT).start()
 
-    print("Server running at http://localhost:8080/")
-    while True:
-        await asyncio.sleep(3600)
+    print(f"UI → http://vibration-server.local:{HTTP_PORT}")
+    while True: await asyncio.sleep(3600)
 
 asyncio.run(main())
